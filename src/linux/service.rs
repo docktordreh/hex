@@ -7,7 +7,7 @@
 //! API instead, answered by `linux_app`'s control host; dictation commands go
 //! from there straight to the listener's command queue, never through the
 //! window's thread. This module also owns the
-//! per-user systemd lifecycle (`Type=notify` readiness, the session
+//! per-user supervisor lifecycle (systemd or runit readiness, the session
 //! environment, start, stop, and restart).
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -41,6 +41,12 @@ const UNIT: &str = "hex.service";
 /// units are ready when `systemctl start` returns; units an older installer
 /// wrote are `Type=simple` and need the wait.
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Debug)]
+enum Supervisor {
+    Systemd,
+    Runit(PathBuf),
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum Request {
@@ -914,17 +920,14 @@ pub(crate) fn notify(state: &str) {
     }
 }
 
-fn unit() -> String {
+pub(crate) fn unit() -> String {
     std::env::var("HEX_SYSTEMD_UNIT")
         .ok()
         .filter(|unit| !unit.is_empty())
         .unwrap_or_else(|| UNIT.into())
 }
 
-/// Whether launches start Hex through its systemd user unit: the unit is
-/// installed (by the installer or Home Manager) and this process uses the
-/// default data root, or explicitly names an isolated test unit.
-pub(crate) fn supervised() -> bool {
+fn systemd_unit_loaded() -> bool {
     if custom_root() {
         return false;
     }
@@ -938,11 +941,63 @@ pub(crate) fn supervised() -> bool {
         })
 }
 
+/// A Void/turnstile user service normally lives in `~/.config/service/hex`.
+/// The traditional `~/service/hex` layout is also accepted, and tests or
+/// custom setups can name another directory explicitly.
+pub(crate) fn runit_service_path() -> Option<PathBuf> {
+    if custom_root() {
+        return None;
+    }
+    let configured = std::env::var_os("HEX_RUNIT_SERVICE")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from);
+    runit_service_path_from(configured, dirs::config_dir(), dirs::home_dir())
+}
+
+fn runit_service_path_from(
+    configured: Option<PathBuf>,
+    config: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let candidates = match configured {
+        Some(path) => vec![path],
+        None => match (config, home) {
+            (Some(config), Some(home)) => {
+                vec![config.join("service/hex"), home.join("service/hex")]
+            }
+            (Some(config), None) => vec![config.join("service/hex")],
+            (None, Some(home)) => vec![home.join("service/hex")],
+            (None, None) => Vec::new(),
+        },
+    };
+    candidates.into_iter().find(|path| {
+        fs::metadata(path).is_ok_and(|metadata| metadata.is_dir())
+            && fs::metadata(path.join("run"))
+                .is_ok_and(|metadata| metadata.is_file() && metadata.mode() & 0o111 != 0)
+    })
+}
+
+fn supervisor() -> Option<Supervisor> {
+    if custom_root() {
+        return None;
+    }
+    if systemd_unit_loaded() {
+        Some(Supervisor::Systemd)
+    } else {
+        runit_service_path().map(Supervisor::Runit)
+    }
+}
+
+/// Whether launches start Hex through an installed per-user supervisor.
+pub(crate) fn supervised() -> bool {
+    supervisor().is_some()
+}
+
 /// A custom data root uses only its supplied desktop environment, not the
 /// user's manager or discovered display sockets. `HEX_SYSTEMD_UNIT` opts an
 /// isolated test into a managed unit explicitly. A root that names the
 /// default folder (Home Manager's unit sets it, #1140) is not custom.
-fn custom_root() -> bool {
+pub(crate) fn custom_root() -> bool {
     std::env::var_os("HEX_SYSTEMD_UNIT").is_none()
         && std::env::var_os("HEX_APPLICATION_SUPPORT_DIR")
             .is_some_and(|root| !default_root(Path::new(&root), dirs::data_dir().as_deref()))
@@ -985,8 +1040,53 @@ fn systemctl(arguments: &[&str]) -> Result<()> {
     }
 }
 
+fn runit(arguments: &[&str], service: &Path) -> Result<()> {
+    let mut child = Command::new("sv")
+        .args(arguments)
+        .arg(service)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .wrap_err("Could not run sv")?;
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if !status.success() {
+                bail!(
+                    "sv {} {} failed; inspect `sv status {}`",
+                    arguments.join(" "),
+                    service.display(),
+                    service.display()
+                );
+            }
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("Timed out controlling {}", service.display());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn control(supervisor: &Supervisor, arguments: &[&str]) -> Result<()> {
+    match supervisor {
+        Supervisor::Systemd => systemctl(arguments),
+        Supervisor::Runit(service) => runit(arguments, service),
+    }
+}
+
+fn supervisor_description(supervisor: &Supervisor) -> String {
+    match supervisor {
+        Supervisor::Systemd => unit(),
+        Supervisor::Runit(service) => service.display().to_string(),
+    }
+}
+
 /// Waits until the started unit answers.
-fn wait_ready() -> Result<Status> {
+fn wait_ready(supervisor: &Supervisor) -> Result<Status> {
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
         match request(Request::Status) {
@@ -994,9 +1094,12 @@ fn wait_ready() -> Result<Status> {
             Err(RequestError::Outdated) => return Err(RequestError::Outdated.into()),
             Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
             Err(error) => {
+                let diagnostic = match supervisor {
+                    Supervisor::Systemd => format!("journalctl --user -u {}", unit()),
+                    Supervisor::Runit(service) => format!("sv status {}", service.display()),
+                };
                 return Err(eyre!(
-                    "Hex did not become ready ({error}); inspect `journalctl --user -u {}`",
-                    unit()
+                    "Hex did not become ready ({error}); inspect `{diagnostic}`"
                 ));
             }
         }
@@ -1029,8 +1132,9 @@ pub(crate) fn another_instance_answers() -> bool {
 }
 
 /// `hex`, `hex app`, and `hex start`: forward to the running instance, start
-/// the systemd unit, or tell the caller to become the instance.
+/// the installed supervisor service, or tell the caller to become the instance.
 pub(crate) fn launch(activation: &Activation, show: bool) -> Result<Launch> {
+    let supervisor = supervisor();
     let activate = || Request::Activate {
         activation: activation.clone(),
         show,
@@ -1038,26 +1142,40 @@ pub(crate) fn launch(activation: &Activation, show: bool) -> Result<Launch> {
     };
     match request(activate()) {
         Ok(status) if status.session == Session::current() => return Ok(Launch::Forwarded),
-        Ok(_) if supervised() => {
-            // Hand the instance over to this desktop session.
-            restart()?;
-        }
         Ok(_) => {
-            bail!("Hex is running in another desktop session; run `hex quit`, then launch it again")
+            if let Some(supervisor) = supervisor.as_ref() {
+                // Hand the instance over to this desktop session.
+                restart_with(supervisor)?;
+            } else {
+                bail!(
+                    "Hex is running in another desktop session; run `hex quit`, then launch it again"
+                );
+            }
         }
-        Err(RequestError::Outdated) if supervised() => restart()?,
-        Err(RequestError::NotRunning) if supervised() => {
+        Err(RequestError::Outdated) => {
+            if let Some(supervisor) = supervisor.as_ref() {
+                restart_with(supervisor)?;
+            } else {
+                return Err(RequestError::Outdated.into());
+            }
+        }
+        Err(RequestError::NotRunning) => {
+            let Some(supervisor) = supervisor.as_ref() else {
+                return Ok(Launch::BecomeInstance);
+            };
             write_session_environment()?;
-            systemctl(&["start"])?;
+            control(supervisor, &["start"])?;
         }
-        Err(RequestError::NotRunning) => return Ok(Launch::BecomeInstance),
         Err(error) => return Err(error.into()),
     }
-    let status = wait_ready()?;
+    let Some(supervisor) = supervisor.as_ref() else {
+        return Err(eyre!("Hex supervisor disappeared while it was starting"));
+    };
+    let status = wait_ready(supervisor)?;
     if status.session != Session::current() {
         bail!(
             "{} did not load this desktop's environment; check its EnvironmentFile",
-            unit()
+            supervisor_description(supervisor)
         );
     }
     request(activate())?;
@@ -1065,18 +1183,28 @@ pub(crate) fn launch(activation: &Activation, show: bool) -> Result<Launch> {
 }
 
 pub(crate) fn restart() -> Result<()> {
-    if !supervised() {
-        bail!("Only Hex started by its systemd unit restarts; run `hex quit`, then launch it");
-    }
+    let supervisor = supervisor().ok_or_else(|| {
+        eyre!("Only Hex started by a managed service restarts; run `hex quit`, then launch it")
+    })?;
+    restart_with(&supervisor)
+}
+
+fn restart_with(supervisor: &Supervisor) -> Result<()> {
     // Without a desktop (over SSH), keep the one Hex last ran in.
     if graphical_session() || !session_environment_path()?.exists() {
         write_session_environment()?;
     }
-    systemctl(&["restart"])
+    control(supervisor, &["restart"])
 }
 
 pub(crate) fn schedule_restart() -> Result<()> {
-    systemctl(&["--no-block", "restart"])
+    let supervisor = supervisor().ok_or_else(|| {
+        eyre!("Only Hex started by a managed service restarts; run `hex quit`, then launch it")
+    })?;
+    match supervisor {
+        Supervisor::Systemd => systemctl(&["--no-block", "restart"]),
+        Supervisor::Runit(service) => runit(&["restart"], &service),
+    }
 }
 
 /// The display the process connects to. Absent values are written empty
@@ -1170,6 +1298,63 @@ fn write_session_environment() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runit_service_discovery_matches_enabled_user_service_locations() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("hex-runit-discovery-{unique}"));
+        let config = root.join("config");
+        let home = root.join("home");
+        assert_eq!(
+            runit_service_path_from(None, Some(config.clone()), Some(home.clone())),
+            None
+        );
+
+        let traditional = home.join("service/hex");
+        fs::create_dir_all(&traditional).unwrap();
+        fs::write(traditional.join("run"), "#!/bin/sh\n").unwrap();
+        assert_eq!(
+            runit_service_path_from(None, Some(config.clone()), Some(home.clone())),
+            None,
+            "a non-executable run file is not a usable service"
+        );
+        fs::set_permissions(traditional.join("run"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            runit_service_path_from(None, Some(config.clone()), Some(home.clone())),
+            Some(traditional.clone())
+        );
+
+        let turnstile = config.join("service/hex");
+        fs::create_dir_all(&turnstile).unwrap();
+        fs::write(turnstile.join("run"), "#!/bin/sh\n").unwrap();
+        fs::set_permissions(turnstile.join("run"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            runit_service_path_from(None, Some(config.clone()), Some(home.clone())),
+            Some(turnstile.clone())
+        );
+
+        let explicit = root.join("explicit/hex");
+        fs::create_dir_all(&explicit).unwrap();
+        fs::write(explicit.join("run"), "#!/bin/sh\n").unwrap();
+        fs::set_permissions(explicit.join("run"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            runit_service_path_from(Some(explicit.clone()), Some(config), Some(home)),
+            Some(explicit)
+        );
+        assert_eq!(
+            runit_service_path_from(
+                Some(root.join("missing")),
+                Some(root.join("config")),
+                Some(root.join("home"))
+            ),
+            None,
+            "an explicit service path does not silently fall back"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn frames_round_trip_and_reject_oversized_input() {

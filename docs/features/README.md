@@ -2224,10 +2224,13 @@ Linux beta                               // not macOS feature parity
 │   ├── Background portal (GNOME, KDE; xdg-desktop-portal 1.20+) -> the portal writes it (X-XDP-Autostart=anomaly.hex; linux/background)
 │   ├── Installed by mise or asdf -> starts the version manager's shim, if it runs Hex from home
 │   ├── An entry without the mark -> error beside the row; Hex never replaces it
-│   └── A user target wants hex.service (~/.config/systemd/user/*.wants/hex.service:
-│       Home Manager's programs.hex.autostart, `systemctl --user enable`) -> on;
-│       turning it off errors, naming where to disable it; no entry is written (#1164)
-│       // check: an_enabled_systemd_unit_starts_hex_at_login (the link scan only)
+│   └── A managed user service starts Hex -> on; turning it off errors, naming where to disable it;
+│       no autostart entry is written
+│       ├── systemd: a target wants hex.service (~/.config/systemd/user/*.wants/hex.service;
+│       │   Home Manager's programs.hex.autostart, `systemctl --user enable`) (#1164)
+│       └── runit: ~/.config/service/hex or ~/service/hex
+│           // checks: an_enabled_systemd_unit_starts_hex_at_login and
+│           // runit_service_discovery_matches_enabled_user_service_locations
 ├── Microphone failure -> Same recovery as macOS, except an interrupted dictation is never kept (RecoveringAudioInput)
 │   ├── Stream fails -> Cancel an unfinished capture (macOS transcribes and copies a held one), "reopening" failure, retry with backoff
 │   ├── Startup open fails -> Retry with backoff; the listener keeps running
@@ -2546,6 +2549,8 @@ evaluates the module, not a live activation.
 Linux process                            // maintain.linux-service
 ├── hex / hex app -> Hex running? -> Activate{activation token} over the socket -> exit 0
 │   ├── No Hex, hex.service loaded -> session.env -> systemctl start (Type=notify) -> Activate
+│   ├── No Hex, runit service found (~/.config/service/hex or ~/service/hex)
+│   │   -> session.env -> sv start -> wait for socket -> Activate
 │   ├── No Hex, no unit or custom data dir -> This process becomes Hex
 │   │   └── Custom data dir -> Keep the supplied desktop environment; no user-manager query
 │   │       or Wayland socket discovery (unless HEX_SYSTEMD_UNIT explicitly opts in)
@@ -2569,8 +2574,8 @@ Linux process                            // maintain.linux-service
 ├── Open the window -> Maps at 980×760 (min = max), tiling WMs float it -> Resizable from 860×560
 ├── Close the window -> Keep microphone, accepted jobs, model preparation, and HUD
 │   └── Uncommitted shortcut capture -> Cancel and restore the prior listening state
-├── Crash -> systemd Restart=on-failure -> Hex without a window
-├── Update -> Restart the unit -> Hex reopens the window
+├── Crash -> systemd or runit restarts Hex without a window
+├── Update -> Restart the managed service -> Hex reopens the window
 ├── hex restart without a display (SSH) -> Keep the saved session.env
 ├── Saved XAUTHORITY file gone (a reboot: Xwayland's cookie is new each login)
 │   -> Take the user manager's current XAUTHORITY, else drop it (#465)
@@ -2580,7 +2585,7 @@ Linux process                            // maintain.linux-service
 ```
 
 Sources: the process, host, and window seam in [linux/app.rs](../../src/linux/app.rs),
-the single-instance socket and systemd lifecycle in
+the single-instance socket and systemd/runit lifecycle in
 [linux/service.rs](../../src/linux/service.rs), the CLI in
 [linux.rs](../../src/linux.rs), and the managed installer/Nix user units.
 `hex status` queries the running Hex; `--lines` explicitly reads historical

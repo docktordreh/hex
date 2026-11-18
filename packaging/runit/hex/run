@@ -1,0 +1,21 @@
+#!/bin/sh
+set -eu
+
+umask 077
+cd "${HOME:?HOME is required for the Hex runit service}"
+
+# Hex writes this file when a launcher starts it from the graphical session.
+# Loading it lets a runit service started before the desktop inherit the same
+# display and D-Bus session that Hex would use under systemd.
+session_env=${XDG_DATA_HOME:-"$HOME/.local/share"}/hex/session.env
+if [ -r "$session_env" ]; then
+	# shellcheck disable=SC1090 # Generated per-user environment file.
+	. "$session_env"
+fi
+
+# turnstile exposes the graphical session through an envdir. Apply it after
+# session.env so the current login environment wins over an older saved value.
+if [ -n "${TURNSTILE_ENV_DIR:-}" ] && [ -d "$TURNSTILE_ENV_DIR" ]; then
+	exec chpst -e "$TURNSTILE_ENV_DIR" /usr/bin/hex service
+fi
+exec /usr/bin/hex service

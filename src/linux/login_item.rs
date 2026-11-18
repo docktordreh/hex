@@ -127,9 +127,9 @@ fn move_legacy_entry_in(directory: &Path) -> Result<()> {
     .wrap_err_with(|| format!("could not move {}", legacy.display()))
 }
 
-/// Whether the desktop starts Hex at login: its autostart entry, or a user
-/// target that wants `hex.service`, as the Home Manager module's `autostart`
-/// or `systemctl --user enable hex.service` sets up (#1164).
+/// Whether the desktop starts Hex at login: its autostart entry, or a
+/// supervisor-managed user service. Systemd's enabled unit and Void's
+/// `~/.config/service/hex` runit service are both treated as external state.
 pub fn is_enabled() -> Result<bool> {
     if service_enabled() {
         return Ok(true);
@@ -149,17 +149,32 @@ pub fn set_enabled(enabled: bool) -> Result<()> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *changed = true;
-    // systemd starts Hex at login; that unit is the user's (or Home
+    // A supervisor starts Hex at login; that service is the user's (or Home
     // Manager's) to enable, and an autostart entry beside it would only
     // start Hex twice.
     if service_enabled() {
         if enabled {
             return Ok(());
         }
+        if systemd_service_enabled() {
+            let unit = crate::linux::service::unit();
+            if unit == "hex.service" {
+                bail!(
+                    "Hex starts at login through its systemd user service (hex.service); \
+                     turn it off where it was enabled, such as programs.hex.autostart in \
+                     Home Manager or `systemctl --user disable hex.service`"
+                );
+            }
+            bail!(
+                "Hex starts at login through its systemd user service ({unit}); disable it with `systemctl --user disable {unit}`"
+            );
+        }
+        let service = crate::linux::service::runit_service_path().map_or_else(
+            || "the configured service".to_owned(),
+            |path| path.display().to_string(),
+        );
         bail!(
-            "Hex starts at login through its systemd user service (hex.service); \
-             turn it off where it was enabled, such as programs.hex.autostart in \
-             Home Manager or `systemctl --user disable hex.service`"
+            "Hex starts at login through the runit user service at {service}; disable it by removing its service link or running `sv down` on that service"
         );
     }
     let path = entry_path()?;
@@ -216,14 +231,27 @@ pub fn announce_background() {
     }
 }
 
-/// Whether a user target in `~/.config/systemd/user` wants `hex.service`:
-/// the link `systemctl --user enable` and Home Manager's `WantedBy` leave.
+/// Whether a user target wants `hex.service`, or a user runit service is
+/// enabled in Void/turnstile's config directory or the traditional `~/service`.
 fn service_enabled() -> bool {
-    dirs::config_dir()
-        .is_some_and(|config| service_enabled_in(&config.join("systemd").join("user")))
+    systemd_service_enabled() || runit_service_enabled()
 }
 
-fn service_enabled_in(units: &Path) -> bool {
+fn systemd_service_enabled() -> bool {
+    !crate::linux::service::custom_root()
+        && dirs::config_dir().is_some_and(|config| {
+            service_enabled_in(
+                &config.join("systemd").join("user"),
+                &crate::linux::service::unit(),
+            )
+        })
+}
+
+fn runit_service_enabled() -> bool {
+    crate::linux::service::runit_service_path().is_some()
+}
+
+fn service_enabled_in(units: &Path, unit: &str) -> bool {
     let Ok(entries) = fs::read_dir(units) else {
         return false;
     };
@@ -232,7 +260,7 @@ fn service_enabled_in(units: &Path) -> bool {
             .file_name()
             .to_str()
             .is_some_and(|name| name.ends_with(".wants"))
-            && fs::symlink_metadata(entry.path().join("hex.service")).is_ok()
+            && fs::symlink_metadata(entry.path().join(unit)).is_ok()
     })
 }
 
@@ -553,15 +581,21 @@ mod tests {
             .unwrap()
             .as_nanos();
         let units = std::env::temp_dir().join(format!("hex-login-units-{unique}"));
-        assert!(!service_enabled_in(&units));
+        assert!(!service_enabled_in(&units, "hex.service"));
         fs::create_dir_all(&units).unwrap();
         fs::write(units.join("hex.service"), "[Unit]\n").unwrap();
-        assert!(!service_enabled_in(&units));
+        assert!(!service_enabled_in(&units, "hex.service"));
         let wants = units.join("graphical-session.target.wants");
         fs::create_dir_all(&wants).unwrap();
-        assert!(!service_enabled_in(&units));
+        assert!(!service_enabled_in(&units, "hex.service"));
         std::os::unix::fs::symlink(units.join("hex.service"), wants.join("hex.service")).unwrap();
-        assert!(service_enabled_in(&units));
+        assert!(service_enabled_in(&units, "hex.service"));
+
+        fs::write(units.join("custom.service"), "[Unit]\n").unwrap();
+        assert!(!service_enabled_in(&units, "custom.service"));
+        std::os::unix::fs::symlink(units.join("custom.service"), wants.join("custom.service"))
+            .unwrap();
+        assert!(service_enabled_in(&units, "custom.service"));
         fs::remove_dir_all(units).unwrap();
     }
 
